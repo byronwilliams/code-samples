@@ -1,0 +1,215 @@
+#!/usr/bin/env coffee
+
+path = require "path"
+fs = require "fs"
+
+Q = require "q"
+date_utils = require "date-utils"
+rsync = require("rsyncwrapper").rsync
+
+crypto = require "crypto"
+
+bbmarkup = require("/home/byron/bumblebee/colony/engine.js")
+
+argv = require("optimist")
+  .usage("Usage: ssgen -D base_dir")
+  .demand(["D"])
+  .describe("D", "Base Directory")
+  .argv
+
+# Helper Functions
+
+_readConfig = () ->
+  cpath = path.resolve argv.D + "/config.json"
+  f = fs.readFileSync cpath
+  config = JSON.parse f
+
+  config.baseDir = argv.D
+
+  config
+
+_dirContents = (dir) ->
+  dpath = path.normalize dir
+  files = fs.readdirSync dpath
+
+  result = []
+
+  for f in files
+    fullPath = path.normalize dir + "/" + f
+    stats = fs.statSync fullPath
+
+    if stats.isFile()
+      result.push
+        _type: "file"
+        _fileName: f
+        _fullPath: fullPath
+        _contents: fs.readFileSync fullPath, "utf-8"
+    else if stats.isDirectory()
+      result.push
+        _type: "directory"
+        _fileName: f
+        _fullPath: fullPath
+        _contents: _dirContents fullPath
+
+  flatten = (array) ->
+    array.unshift []
+    array.reduce (a,b) ->
+      if b._type is "directory"
+        a.concat flatten b._contents
+      else
+        a.concat b
+
+  flatten result
+
+_splitDoc = (postContent) ->
+  [head, content] = postContent.split "\n\}\n"
+
+  settings: JSON.parse head + "}"
+  content: content
+
+_readDocuments = (subdirectory) ->
+  rawDocs = _dirContents config.baseDir + subdirectory
+  docs = []
+
+  for rawDoc in rawDocs
+    rawSplit = _splitDoc(rawDoc._contents)
+
+    doc = rawSplit.settings
+    doc.raw_content = rawSplit.content
+
+    if rawDoc._type is "file"
+      docs.push doc
+
+  docs
+
+# Global Arguments
+config    = _readConfig()
+
+env = new bbmarkup.Environment()
+env.registerFilter "normalize", (s) ->
+  Q.fcall ->
+    s
+      .toLowerCase()
+      .replace /[ _]/g, "-"
+      .replace /[^a-zA-Z0-9-]/g, ""
+env.registerFilter "published", (docs) ->
+  Q.fcall ->
+    docs.slice(0).filter (doc, _idx, _array) ->
+      return new Date(doc.publishDate) <= new Date()
+
+
+# Main Code
+readPosts = () ->
+  docs = _readDocuments config.postsDir
+
+  for doc in docs
+    doc.type = "post"
+
+  docs
+
+readPages = () ->
+  docs = _readDocuments config.pagesDir
+
+  for doc in docs
+    doc.type = "page"
+
+  docs
+
+readTemplates = () ->
+  templates = _dirContents config.baseDir + config.templatesDir
+
+  tmpls = {}
+
+  for t in templates
+    fp = t._fileName.split(".")[0]
+    tmpls[fp] = t
+  tmpls
+
+transform = (pages,posts,templates) ->
+  docs = [].concat(pages).concat(posts)
+
+  _genPermalink = (doc) ->
+    deferred = Q.defer()
+    if not doc.permalink
+      permalink_tmpl = new bbmarkup.Template()
+      deferred.resolve permalink_tmpl.render env, config.permalink, doc
+    else
+      deferred.resolve doc.permalink
+
+    deferred.promise
+
+  _renderDoc = (post,template) ->
+    post["site"] = config.site
+    post["posts"] = posts
+    tmpl = new bbmarkup.Template()
+    html = tmpl.render env, template._contents, post
+
+  _hash = (txt) ->
+    sha1sum = crypto.createHash "sha1"
+    sha1sum.update txt
+    sha1sum.digest "hex"
+
+  _writeOutput = (post,html) ->
+    Q.fcall ->
+      outPath = config.baseDir + config.outputDir + "/" + post.permalink + ".html"
+
+      if fs.existsSync outPath
+        contents = fs.readFileSync outPath, "utf-8"
+
+        if _hash(contents) != _hash(html)
+          fs.writeFile outPath, html, "utf-8"
+          console.log "written: "  + post.permalink
+      else
+        fs.writeFile outPath, html, "utf-8"
+        console.log "written: "  + post.permalink
+
+  docs.map (doc) ->
+    _genPermalink(doc).then (permalink) ->
+      doc["permalink"] = permalink
+
+      _renderDoc(doc,templates[doc.template]).then (html) ->
+        _writeOutput(doc,html)
+      ,(error) ->
+        console.log "FAIL"
+        console.log error
+
+cleanOutputFolder = (posts, pages) ->
+  raw_files = _dirContents config.baseDir + config.outputDir
+  docs = [].concat(pages).concat(posts)
+
+  #for f in raw_files
+    #if f._type is "directory" and f._fileName is "static"
+      #console.log "skipping over static folder"
+    #else if f._type is "file"
+      # TODO: Unlink only if file has changed
+      #fs.unlinkSync f._fullPath
+
+rSyncStatic = () ->
+  staticRoot = config.baseDir + config.staticDir
+
+  # Copy the Static File over
+  rsync
+    src: staticRoot
+    dest: config.baseDir + config.outputDir + "/"
+    recursive: true
+    syncDest: true
+    dryRun: false
+  , (err,stdout,stderr,cmd) ->
+    #console.log "rSync Done"
+    #console.log [err,stdout,stderr,cmd]
+
+
+run = () ->
+  pages       = readPages()
+  posts       = readPosts()
+  templates   = readTemplates()
+  #cleanOutputFolder(posts,pages)
+  transform(pages,posts,templates)
+  rSyncStatic()
+
+if true
+  setInterval () ->
+    run()
+  , 2000
+else
+  run()
